@@ -12,7 +12,9 @@ SNN with a gating head, and provides a training entrypoint.
    pip install -r project/requirements.txt
    ```
 2. Download and extract the Kaggle dataset so it contains `train/` and `test/`
-   folders (e.g., `./data/UCI_HAR_Dataset`).
+   folders (e.g., `./data/UCI_HAR_Dataset`). Network access is restricted in
+   this environment, so the repository does not include the dataset; see
+   `project/data/README.md` for manual download instructions.
 
 ## Training
 
