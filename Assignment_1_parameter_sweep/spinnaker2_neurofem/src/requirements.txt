@@ -2,4 +2,3 @@ numpy
 scikit-fem[all]
 matplotlib
 jupyter
-requirements/spinnaker2
