@@ -1,5 +1,6 @@
+# offline_snn_sim.py
 # -*- coding: utf-8 -*-
-# offline_snn_sim.py  (BIPOLAR input encoding: ON/OFF neurons per feature)
+
 import argparse
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def load_har_csv(path: Path):
     if "Activity" not in df.columns or "subject" not in df.columns:
         raise ValueError(f"{path} must contain 'Activity' and 'subject' columns.")
     X = df.drop(columns=["Activity", "subject"]).values.astype(np.float32)
-    y = df["Activity"].values
+    y = df["Activity"].values.astype(str)
     return X, y
 
 
@@ -46,18 +47,10 @@ def quantize_bias(b: np.ndarray, scale: float, b_max: int = 127):
 
 
 def bipolar_rates(x: np.ndarray, r_max_hz: float):
-    """
-    x is standardized feature vector (can be negative).
-    Build ON/OFF rates:
-      pos neuron rate ~ max(x, 0)
-      neg neuron rate ~ max(-x, 0)
-    Then concatenate => length 2*D
-    """
+    # ON/OFF encoding
     pos = np.maximum(x, 0.0)
     neg = np.maximum(-x, 0.0)
 
-    # Robust scaling to [0,1] per sample:
-    # divide by (max absolute) so the strongest feature gets rate ~ r_max_hz
     maxv = float(np.max(pos + neg) + 1e-12)
     pos01 = pos / maxv
     neg01 = neg / maxv
@@ -72,17 +65,12 @@ def poisson_spikes(rates_hz: np.ndarray, T: int, rng: np.random.Generator):
 
 
 def lif_layer(spikes_in: np.ndarray, Wq: np.ndarray, bq: np.ndarray, thr: float, decay: float, bias_gain: float):
-    """
-    spikes_in: [T, N_in] {0,1}
-    Wq:       [N_out, N_in] int
-    bq:       [N_out] int
-    """
     T, N_in = spikes_in.shape
     N_out, N_in2 = Wq.shape
     if N_in != N_in2:
-        raise ValueError(f"Shape mismatch: spikes_in has {N_in}, Wq expects {N_in2}")
+        raise ValueError(f"Shape mismatch: spikes_in {N_in} vs Wq {N_in2}")
     if bq.shape[0] != N_out:
-        raise ValueError(f"Shape mismatch: bq has {bq.shape[0]}, Wq has {N_out}")
+        raise ValueError(f"Shape mismatch: bq {bq.shape[0]} vs Wq out {N_out}")
 
     v = np.zeros(N_out, dtype=np.float32)
     out = np.zeros((T, N_out), dtype=np.int8)
@@ -106,12 +94,10 @@ def main():
     ap.add_argument("--w_max", type=int, default=15)
     ap.add_argument("--decay", type=float, default=0.92)
 
-    # thresholds
     ap.add_argument("--thr1", type=float, default=25.0)
     ap.add_argument("--thr2", type=float, default=25.0)
     ap.add_argument("--thr3", type=float, default=60.0)
 
-    # bias gains
     ap.add_argument("--bias1", type=float, default=0.05)
     ap.add_argument("--bias2", type=float, default=0.05)
     ap.add_argument("--bias3", type=float, default=0.02)
@@ -126,14 +112,10 @@ def main():
     y = np.array([class_to_idx[v] for v in y_raw], dtype=np.int64)
 
     X_test = standardize(X_test, mean, scale)
-    tested = min(args.num_samples, X_test.shape[0])
 
-    # ---- Expand first-layer weights for bipolar input ----
-    # Original: W1 shape [H1, D]
-    # New input has 2D: [x_pos, x_neg], with weights [W, -W]
-    W1_bipolar = np.concatenate([W1, -W1], axis=1)  # shape [H1, 2D]
+    # Expand first-layer weights for bipolar input: [W, -W]
+    W1_bipolar = np.concatenate([W1, -W1], axis=1)
 
-    # Quantize
     W1q, s1 = quantize_weights(W1_bipolar, w_max=args.w_max)
     W2q, s2 = quantize_weights(W2, w_max=args.w_max)
     W3q, s3 = quantize_weights(W3, w_max=args.w_max)
@@ -143,10 +125,11 @@ def main():
     b3q = quantize_bias(b3, scale=s3)
 
     rng = np.random.default_rng(args.seed)
+    tested = min(args.num_samples, X_test.shape[0])
     correct = 0
 
     for i in range(tested):
-        rates = bipolar_rates(X_test[i], r_max_hz=args.r_max_hz)  # length 2D
+        rates = bipolar_rates(X_test[i], r_max_hz=args.r_max_hz)
         s_in = poisson_spikes(rates, T=args.T, rng=rng)
 
         s_h1 = lif_layer(s_in, W1q, b1q, thr=args.thr1, decay=args.decay, bias_gain=args.bias1)
