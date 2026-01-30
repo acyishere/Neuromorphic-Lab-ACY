@@ -51,8 +51,6 @@ def eval_model(model, X, y):
 
 
 def export_ann_params(model: nn.Module, out_path: Path, classes, scaler: StandardScaler):
-    # Extract weights/biases as numpy float32
-    # Architecture: Linear(in->h1), Linear(h1->h2), Linear(h2->out)
     layers = [m for m in model.net if isinstance(m, nn.Linear)]
     if len(layers) != 3:
         raise ValueError("Expected exactly 3 Linear layers (in->h1, h1->h2, h2->out).")

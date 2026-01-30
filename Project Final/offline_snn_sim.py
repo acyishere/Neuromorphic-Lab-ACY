@@ -47,7 +47,6 @@ def quantize_bias(b: np.ndarray, scale: float, b_max: int = 127):
 
 
 def bipolar_rates(x: np.ndarray, r_max_hz: float):
-    # ON/OFF encoding
     pos = np.maximum(x, 0.0)
     neg = np.maximum(-x, 0.0)
 
