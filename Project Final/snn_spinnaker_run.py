@@ -41,6 +41,7 @@ def quantize_weights(W: np.ndarray, w_max: int = 15):
 
 
 def dense_to_conn_list(Wq: np.ndarray, delay: int = 1):
+    # Wq: [post, pre]
     out_dim, _ = Wq.shape
     conns = []
     for post in range(out_dim):
@@ -52,6 +53,10 @@ def dense_to_conn_list(Wq: np.ndarray, delay: int = 1):
 
 
 def dense_to_conn_list_pre_slice(Wq: np.ndarray, pre_lo: int, pre_hi: int, delay: int = 1):
+    """
+    Wq: [post, pre_total]
+    Build conns for pre in [pre_lo, pre_hi), remap pre index to local [0..pre_hi-pre_lo-1]
+    """
     out_dim, _ = Wq.shape
     conns = []
     for post in range(out_dim):
@@ -63,6 +68,10 @@ def dense_to_conn_list_pre_slice(Wq: np.ndarray, pre_lo: int, pre_hi: int, delay
 
 
 def compute_ranges(total: int, parts: int):
+    """
+    Split [0,total) into 'parts' ranges, allowing uneven last ranges.
+    Returns list of (lo, hi).
+    """
     parts = max(1, int(parts))
     base = total // parts
     rem = total % parts
@@ -72,10 +81,9 @@ def compute_ranges(total: int, parts: int):
         size = base + (1 if i < rem else 0)
         lo = start
         hi = start + size
-        if hi > lo:
-            ranges.append((lo, hi))
+        ranges.append((lo, hi))
         start = hi
-    return ranges
+    return [r for r in ranges if r[1] > r[0]]
 
 
 def bipolar_rates(x: np.ndarray, r_max_hz: float):
@@ -110,31 +118,16 @@ def decode_output(spike_dict: dict, out_dim: int):
 
 
 def set_atoms(pop, n: int):
+    # Some stacks provide this method; guard just in case.
     if hasattr(pop, "set_max_atoms_per_core"):
         pop.set_max_atoms_per_core(int(n))
-
-
-def make_hw(hardware_mod, board: str, s2_ip: str):
-    board = (board or "").lower().strip()
-    if board in ("cloud48", "cloud", "spinncloud48", "spinncloud"):
-        if not hasattr(hardware_mod, "SpiNNcloud48NodeBoard"):
-            raise RuntimeError("This spinnaker2 stack has no SpiNNcloud48NodeBoard().")
-        return hardware_mod.SpiNNcloud48NodeBoard()
-    if board in ("chip", "s2chip", "eth"):
-        if not hasattr(hardware_mod, "SpiNNaker2Chip"):
-            raise RuntimeError("This spinnaker2 stack has no SpiNNaker2Chip().")
-        return hardware_mod.SpiNNaker2Chip(eth_ip=s2_ip)
-    raise ValueError("--board must be 'chip' or 'cloud48'")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ann_npz", type=str, default="ann_params_har.npz")
     ap.add_argument("--test_csv", type=str, default="test.csv")
-
-    ap.add_argument("--board", type=str, default="chip", help="chip (LAN eth_ip) or cloud48")
     ap.add_argument("--s2_ip", type=str, default=os.environ.get("S2_IP", "192.168.1.2"))
-
     ap.add_argument("--num_samples", type=int, default=1)
     ap.add_argument("--duration_ms", type=int, default=200)
     ap.add_argument("--r_max_hz", type=float, default=200.0)
@@ -142,12 +135,16 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dry_run", action="store_true")
 
-    ap.add_argument("--shards", type=int, default=8)
-    ap.add_argument("--input_shards", type=int, default=33)
+    # Hidden sharding (diagonal blocks)
+    ap.add_argument("--shards", type=int, default=8, help="Diagonal shards for H1/H2 (default 8).")
 
-    ap.add_argument("--in_per_core", type=int, default=1)
-    ap.add_argument("--h1_per_core", type=int, default=2)
-    ap.add_argument("--h2_per_core", type=int, default=2)
+    # Input sharding: now can be ANY positive integer (does NOT need to divide 1122)
+    ap.add_argument("--input_shards", type=int, default=33, help="Shard spike_list input (default 33).")
+
+    # **CRITICAL FIX**: limit neurons per core to avoid NEURONS_PARAMS SRAM overflow
+    ap.add_argument("--in_per_core", type=int, default=2)
+    ap.add_argument("--h1_per_core", type=int, default=4)
+    ap.add_argument("--h2_per_core", type=int, default=4)
     ap.add_argument("--out_per_core", type=int, default=6)
 
     args = ap.parse_args()
@@ -159,30 +156,37 @@ def main():
     class_to_idx = {c: i for i, c in enumerate(classes)}
     y_test = np.array([class_to_idx[v] for v in y_raw], dtype=np.int64)
 
+    # Expected ANN shapes: W1 [128,561], W2 [64,128], W3 [6,64]
     if W1.shape != (128, 561) or W2.shape != (64, 128) or W3.shape != (6, 64):
         raise ValueError(f"Unexpected ANN shapes: W1={W1.shape}, W2={W2.shape}, W3={W3.shape}")
 
-    in_dim = 1122
+    D = 561
+    in_dim = 2 * D  # 1122 bipolar input neurons
     out_dim = 6
 
+    # Bipolar expansion for W1: [W, -W] -> [128,1122]
     W1_bipolar = np.concatenate([W1, -W1], axis=1)
 
     W1q, s1 = quantize_weights(W1_bipolar, w_max=args.w_max)
     W2q, s2 = quantize_weights(W2, w_max=args.w_max)
     W3q, s3 = quantize_weights(W3, w_max=args.w_max)
 
+    # Hidden layer diagonal sharding
     shards = max(1, int(args.shards))
     if 128 % shards != 0 or 64 % shards != 0:
         raise ValueError("shards must divide H1=128 and H2=64 (valid: 1,2,4,8,16,32,64).")
     h1_sh = 128 // shards
     h2_sh = 64 // shards
 
-    W1_blocks, W2_blocks, W3_blocks = [], [], []
+    W1_blocks = []
+    W2_blocks = []
+    W3_blocks = []
     for i in range(shards):
-        W1_blocks.append(W1q[i * h1_sh:(i + 1) * h1_sh, :])
-        W2_blocks.append(W2q[i * h2_sh:(i + 1) * h2_sh, i * h1_sh:(i + 1) * h1_sh])
-        W3_blocks.append(W3q[:, i * h2_sh:(i + 1) * h2_sh])
+        W1_blocks.append(W1q[i * h1_sh:(i + 1) * h1_sh, :])  # [h1_sh, in_dim]
+        W2_blocks.append(W2q[i * h2_sh:(i + 1) * h2_sh, i * h1_sh:(i + 1) * h1_sh])  # [h2_sh, h1_sh]
+        W3_blocks.append(W3q[:, i * h2_sh:(i + 1) * h2_sh])  # [out_dim, h2_sh]
 
+    # Input ranges (can be uneven)
     input_ranges = compute_ranges(in_dim, args.input_shards)
 
     print("[INFO] BIPOLAR encoding enabled")
@@ -192,16 +196,15 @@ def main():
     print(f"[INFO] Quant scales: s1={s1:.3f}, s2={s2:.3f}, s3={s3:.3f}")
 
     if args.dry_run:
-        print("[DRY RUN] Not connecting to hardware.")
+        approx_L1 = int(np.count_nonzero(W1q))
+        approx_L2 = int(np.count_nonzero(W2q))
+        approx_L3 = int(np.count_nonzero(W3q))
+        print(f"[INFO] Approx nonzero synapses: L1={approx_L1}, L2={approx_L2}, L3={approx_L3}")
+        print("[DRY RUN] Not connecting to hardware. Conversion looks OK.")
         return
 
+    # Hardware imports
     from spinnaker2 import hardware, snn
-
-    hw = make_hw(hardware, args.board, args.s2_ip)
-    if args.board.lower().startswith("chip"):
-        print(f"[OK] Using SpiNNaker2Chip at {args.s2_ip}")
-    else:
-        print("[OK] Using SpiNNcloud48NodeBoard()")
 
     lif_params = {
         "threshold": 10.0,
@@ -211,6 +214,10 @@ def main():
         "reset": "reset_by_subtraction",
     }
 
+    hw = hardware.SpiNNcloud48NodeBoard(stm_ip=args.s2_ip)
+    print(f"[OK] Connected to SpiNNcloud48NodeBoard at STM_IP={args.s2_ip}")
+
+
     tested = min(int(args.num_samples), X_test.shape[0])
     correct = 0
 
@@ -218,18 +225,27 @@ def main():
         rates = bipolar_rates(X_test[idx], r_max_hz=args.r_max_hz)
         net = snn.Network(f"HAR_SNN_HW_{idx}")
 
+        # Input populations (sharded)
         stim_pops = []
         for j, (lo, hi) in enumerate(input_ranges):
+            local_rates = rates[lo:hi]
             spike_in = poisson_spike_list(
-                rates[lo:hi],
+                local_rates,
                 duration_ms=args.duration_ms,
                 seed=args.seed + idx * 10000 + j,
             )
-            stim = snn.Population(size=(hi - lo), neuron_model="spike_list", params=spike_in, name=f"IN_{j}")
+            stim = snn.Population(
+                size=(hi - lo),
+                neuron_model="spike_list",
+                params=spike_in,
+                name=f"IN_{j}",
+            )
             set_atoms(stim, args.in_per_core)
             stim_pops.append(stim)
 
-        h1_pops, h2_pops = [], []
+        # Hidden pops
+        h1_pops = []
+        h2_pops = []
         for i in range(shards):
             h1 = snn.Population(size=h1_sh, neuron_model="lif_curr_exp", params=lif_params,
                                 name=f"H1_{i}", record=["spikes"])
@@ -246,18 +262,21 @@ def main():
 
         projs = []
 
+        # IN -> H1 : for each H1 shard, connect each input shard slice
         for i in range(shards):
-            W1_blk = W1_blocks[i]
+            W1_blk = W1_blocks[i]  # [h1_sh, in_dim]
             for j, (lo, hi) in enumerate(input_ranges):
                 conns = dense_to_conn_list_pre_slice(W1_blk, pre_lo=lo, pre_hi=hi, delay=1)
                 if conns:
                     projs.append(snn.Projection(pre=stim_pops[j], post=h1_pops[i], connections=conns))
 
+        # H1 -> H2 diagonal
         for i in range(shards):
             conns2 = dense_to_conn_list(W2_blocks[i], delay=1)
             if conns2:
                 projs.append(snn.Projection(pre=h1_pops[i], post=h2_pops[i], connections=conns2))
 
+        # H2 -> OUT merge
         for i in range(shards):
             conns3 = dense_to_conn_list(W3_blocks[i], delay=1)
             if conns3:
