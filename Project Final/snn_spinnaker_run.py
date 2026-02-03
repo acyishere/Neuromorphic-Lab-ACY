@@ -1,303 +1,340 @@
-# snn_spinnaker_run.py
 # -*- coding: utf-8 -*-
+"""
+Hopfield Network based HAR Classification on SpiNNaker2
+Uses Modern Hopfield Network with stored class prototypes
+"""
 
 import argparse
 import os
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 
-def load_ann_npz(npz_path: Path):
-    data = np.load(npz_path, allow_pickle=True)
-    W1 = data["W1"].astype(np.float32)
-    W2 = data["W2"].astype(np.float32)
-    W3 = data["W3"].astype(np.float32)
-    classes = list(data["classes"])
-    mean = data["scaler_mean"].astype(np.float32)
-    scale = data["scaler_scale"].astype(np.float32)
-    return (W1, W2, W3), classes, mean, scale
-
-
 def load_har_csv(path: Path):
     df = pd.read_csv(path)
-    if "Activity" not in df.columns or "subject" not in df.columns:
-        raise ValueError(f"{path} must contain 'Activity' and 'subject' columns.")
     X = df.drop(columns=["Activity", "subject"]).values.astype(np.float32)
     y = df["Activity"].values.astype(str)
     return X, y
 
 
-def standardize(X: np.ndarray, mean: np.ndarray, scale: np.ndarray):
-    return ((X - mean) / (scale + 1e-12)).astype(np.float32)
+def compute_class_prototypes(X_train: np.ndarray, y_train: np.ndarray, classes: list):
+    """
+    Compute mean prototype for each class - these become Hopfield memories
+    """
+    prototypes = {}
+    for cls in classes:
+        mask = (y_train == cls)
+        if np.sum(mask) > 0:
+            prototypes[cls] = np.mean(X_train[mask], axis=0)
+    return prototypes
 
 
-def quantize_weights(W: np.ndarray, w_max: int = 15):
+def binarize(x: np.ndarray, threshold: float = 0.0):
+    """Convert to bipolar {-1, +1} for Hopfield"""
+    return np.where(x >= threshold, 1, -1).astype(np.float32)
+
+
+def hopfield_weights(patterns: np.ndarray):
+    """
+    Compute Hopfield weight matrix using Hebbian learning
+    W_ij = (1/N) * sum_p(xi_p * xj_p)
+    """
+    N = patterns.shape[1]
+    P = patterns.shape[0]
+    W = np.zeros((N, N), dtype=np.float32)
+    
+    for p in range(P):
+        xi = patterns[p].reshape(-1, 1)
+        W += xi @ xi.T
+    
+    W /= N
+    np.fill_diagonal(W, 0)  # No self-connections
+    return W
+
+
+def hopfield_weights_storkey(patterns: np.ndarray):
+    """
+    Storkey learning rule - better capacity than Hebbian
+    """
+    N = patterns.shape[1]
+    P = patterns.shape[0]
+    W = np.zeros((N, N), dtype=np.float32)
+    
+    for p in range(P):
+        xi = patterns[p]
+        h = W @ xi  # Local field before adding pattern
+        for i in range(N):
+            for j in range(N):
+                if i != j:
+                    W[i, j] += (xi[i] * xi[j] - xi[i] * h[j] - xi[j] * h[i]) / N
+    
+    np.fill_diagonal(W, 0)
+    return W
+
+
+def hopfield_energy(state: np.ndarray, W: np.ndarray):
+    """Compute Hopfield energy: E = -0.5 * s^T * W * s"""
+    return -0.5 * state @ W @ state
+
+
+def hopfield_update_async(state: np.ndarray, W: np.ndarray, max_iter: int = 100):
+    """
+    Asynchronous update until convergence
+    """
+    N = len(state)
+    state = state.copy()
+    
+    for _ in range(max_iter):
+        changed = False
+        order = np.random.permutation(N)
+        for i in order:
+            h = W[i] @ state
+            new_s = 1 if h >= 0 else -1
+            if new_s != state[i]:
+                state[i] = new_s
+                changed = True
+        if not changed:
+            break
+    return state
+
+
+def classify_hopfield(query: np.ndarray, prototypes: dict, W: np.ndarray):
+    """
+    Classify by:
+    1. Initialize Hopfield with query
+    2. Run until convergence
+    3. Compare final state with stored prototypes
+    """
+    query_bin = binarize(query)
+    final_state = hopfield_update_async(query_bin, W)
+    
+    best_cls = None
+    best_sim = -np.inf
+    for cls, proto in prototypes.items():
+        proto_bin = binarize(proto)
+        sim = np.dot(final_state, proto_bin)
+        if sim > best_sim:
+            best_sim = sim
+            best_cls = cls
+    
+    return best_cls, final_state
+
+
+def quantize_weights_hopfield(W: np.ndarray, w_max: int = 15):
+    """Quantize Hopfield weights for SpiNNaker"""
     max_abs = float(np.max(np.abs(W)) + 1e-12)
     s = w_max / max_abs
     Wq = np.clip(np.rint(W * s), -w_max, w_max).astype(np.int32)
     return Wq, s
 
 
-def dense_to_conn_list(Wq: np.ndarray, delay: int = 1):
-    # Wq: [post, pre]
-    out_dim, _ = Wq.shape
+def hopfield_to_snn_conns(Wq: np.ndarray, delay: int = 1):
+    """Convert Hopfield weight matrix to SNN connection list"""
+    N = Wq.shape[0]
     conns = []
-    for post in range(out_dim):
-        row = Wq[post]
-        nz = np.nonzero(row)[0]
-        for pre in nz:
-            conns.append([int(pre), int(post), int(row[pre]), int(delay)])
+    for post in range(N):
+        for pre in range(N):
+            if Wq[post, pre] != 0:
+                conns.append([int(pre), int(post), int(Wq[post, pre]), delay])
     return conns
 
 
-def dense_to_conn_list_pre_slice(Wq: np.ndarray, pre_lo: int, pre_hi: int, delay: int = 1):
-    """
-    Wq: [post, pre_total]
-    Build conns for pre in [pre_lo, pre_hi), remap pre index to local [0..pre_hi-pre_lo-1]
-    """
-    out_dim, _ = Wq.shape
-    conns = []
-    for post in range(out_dim):
-        row = Wq[post, pre_lo:pre_hi]
-        nz = np.nonzero(row)[0]
-        for pre_local in nz:
-            conns.append([int(pre_local), int(post), int(row[pre_local]), int(delay)])
-    return conns
+# ...existing code...
 
+def run_single_sample(
+    query_bin: np.ndarray,
+    Wq: np.ndarray,
+    prototypes: dict,
+    classes: list,
+    s2_ip: str,
+    duration_ms: int,
+    sample_idx: int
+):
+    from spinnaker2 import hardware, snn
+    N = len(query_bin)
+    
+    # Updated LIF parameters
+    lif_params = {
+        "threshold": 10.0,
+        "v_rest": 0.0,
+        "v_reset": 0.0,
+        "alpha_decay": 0.9,
+        "i_offset": 0.0,
+        "reset": "reset_to_v_reset"
+    }
+    
+    hw = hardware.SpiNNcloud48NodeBoard(stm_ip=s2_ip)
+    net = snn.Network(f"Hopfield_HAR_{sample_idx}")
 
-def compute_ranges(total: int, parts: int):
-    """
-    Split [0,total) into 'parts' ranges, allowing uneven last ranges.
-    Returns list of (lo, hi).
-    """
-    parts = max(1, int(parts))
-    base = total // parts
-    rem = total % parts
-    ranges = []
-    start = 0
-    for i in range(parts):
-        size = base + (1 if i < rem else 0)
-        lo = start
-        hi = start + size
-        ranges.append((lo, hi))
-        start = hi
-    return [r for r in ranges if r[1] > r[0]]
+    pos_neurons = np.where(query_bin > 0)[0]
+    
+    # Strong input burst to kickstart the pattern
+    spike_times = {i: list(range(0, 80, 5)) if i in pos_neurons else [] for i in range(N)}
 
+    stim = snn.Population(size=N, neuron_model="spike_list", params=spike_times)
+    
+    # Use 'lif' model with proper reset parameter
+    hopfield_pop = snn.Population(
+        size=N, 
+        neuron_model="lif", 
+        params=lif_params, 
+        record=["spikes"]
+    )
 
-def bipolar_rates(x: np.ndarray, r_max_hz: float):
-    pos = np.maximum(x, 0.0)
-    neg = np.maximum(-x, 0.0)
-    maxv = float(np.max(pos + neg) + 1e-12)
-    rates = np.concatenate([pos / maxv, neg / maxv], axis=0) * r_max_hz
-    return rates.astype(np.float32)
+    # Connections
+    input_conns = [[i, i, 15, 1] for i in pos_neurons]
+    # Clip weights to stay within hardware limits and avoid warnings
+    hopfield_conns = hopfield_to_snn_conns(np.clip(Wq, -12, 12), delay=1)
 
+    net.add(stim, hopfield_pop)
+    net.add(snn.Projection(pre=stim, post=hopfield_pop, connections=input_conns))
+    net.add(snn.Projection(pre=hopfield_pop, post=hopfield_pop, connections=hopfield_conns))
 
-def poisson_spike_list(rates_hz: np.ndarray, duration_ms: int, seed: int):
-    rng = np.random.default_rng(seed)
-    p = np.clip(rates_hz / 1000.0, 0.0, 1.0)
-    N = rates_hz.shape[0]
-    spikes = {}
-    for i in range(N):
-        if p[i] <= 0.0:
-            spikes[i] = []
-        else:
-            spikes[i] = [t for t in range(duration_ms) if rng.random() < p[i]]
-    return spikes
+    hw.run(net, duration_ms)
 
+    # Decoding: Check activity at the end of the simulation
+    spikes = hopfield_pop.get_spikes()
+    late_window = int(duration_ms * 0.6)
+    spike_counts = np.zeros(N)
+    
+    for neuron_id, times in spikes.items():
+        spike_counts[int(neuron_id)] = len([t for t in times if t >= late_window])
+    
+    # State determined by spike activity
+    final_state = np.where(spike_counts > 1, 1, -1).astype(np.float32)
 
-def decode_output(spike_dict: dict, out_dim: int):
-    counts = np.zeros(out_dim, dtype=np.int32)
-    for k, times in spike_dict.items():
-        kk = int(k)
-        if 0 <= kk < out_dim:
-            counts[kk] = len(times)
-    pred = int(np.argmax(counts))
-    return pred, counts
-
-
-def set_atoms(pop, n: int):
-    # Some stacks provide this method; guard just in case.
-    if hasattr(pop, "set_max_atoms_per_core"):
-        pop.set_max_atoms_per_core(int(n))
-
+    # Similarity comparison
+    best_cls = max(prototypes.keys(), key=lambda cls: np.dot(final_state, binarize(prototypes[cls])))
+    
+    return best_cls, final_state, int(np.sum(spike_counts)), {}
+# ...existing code...
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ann_npz", type=str, default="ann_params_har.npz")
+    ap.add_argument("--train_csv", type=str, default="train.csv")
     ap.add_argument("--test_csv", type=str, default="test.csv")
-    ap.add_argument("--s2_ip", type=str, default=os.environ.get("S2_IP", "192.168.1.2"))
-    ap.add_argument("--num_samples", type=int, default=1)
-    ap.add_argument("--duration_ms", type=int, default=200)
-    ap.add_argument("--r_max_hz", type=float, default=200.0)
-    ap.add_argument("--w_max", type=int, default=15)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--s2_ip", type=str, default="192.168.1.2")
+    ap.add_argument("--num_samples", type=int, default=10)
+    ap.add_argument("--duration_ms", type=int, default=300)
     ap.add_argument("--dry_run", action="store_true")
-
-    # Hidden sharding (diagonal blocks)
-    ap.add_argument("--shards", type=int, default=8, help="Diagonal shards for H1/H2 (default 8).")
-
-    # Input sharding: now can be ANY positive integer (does NOT need to divide 1122)
-    ap.add_argument("--input_shards", type=int, default=33, help="Shard spike_list input (default 33).")
-
-    # **CRITICAL FIX**: limit neurons per core to avoid NEURONS_PARAMS SRAM overflow
-    ap.add_argument("--in_per_core", type=int, default=2)
-    ap.add_argument("--h1_per_core", type=int, default=4)
-    ap.add_argument("--h2_per_core", type=int, default=4)
-    ap.add_argument("--out_per_core", type=int, default=6)
-
+    ap.add_argument("--reduce_dim", type=int, default=48,  # Reduced for better Hopfield capacity
+                    help="Reduce input dimension via PCA for Hopfield capacity")
+    ap.add_argument("--use_storkey", action="store_true", default=True,
+                    help="Use Storkey learning rule (better capacity)")
     args = ap.parse_args()
 
-    (W1, W2, W3), classes, mean, scale = load_ann_npz(Path(args.ann_npz))
-    X_test, y_raw = load_har_csv(Path(args.test_csv))
-    X_test = standardize(X_test, mean, scale)
+    # Load data
+    X_train, y_train = load_har_csv(Path(args.train_csv))
+    X_test, y_test = load_har_csv(Path(args.test_csv))
+    
+    classes = sorted(list(set(y_train)))
+    print(f"[INFO] Classes: {classes}")
+    print(f"[INFO] Train: {X_train.shape}, Test: {X_test.shape}")
 
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    y_test = np.array([class_to_idx[v] for v in y_raw], dtype=np.int64)
+    # Reduce dimensionality (Hopfield capacity ~ 0.15N for 6 patterns need N >= 40)
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    pca = PCA(n_components=args.reduce_dim)
+    X_train_pca = pca.fit_transform(X_train_scaled)
+    X_test_pca = pca.transform(X_test_scaled)
+    
+    print(f"[INFO] Reduced to {args.reduce_dim} dimensions (PCA variance: {pca.explained_variance_ratio_.sum():.2%})")
 
-    # Expected ANN shapes: W1 [128,561], W2 [64,128], W3 [6,64]
-    if W1.shape != (128, 561) or W2.shape != (64, 128) or W3.shape != (6, 64):
-        raise ValueError(f"Unexpected ANN shapes: W1={W1.shape}, W2={W2.shape}, W3={W3.shape}")
+    # Compute class prototypes
+    prototypes = compute_class_prototypes(X_train_pca, y_train, classes)
+    
+    # Create pattern matrix for Hopfield
+    pattern_matrix = np.array([binarize(prototypes[cls]) for cls in classes])
+    print(f"[INFO] Stored {len(classes)} patterns in Hopfield network")
+    
+    # Check pattern orthogonality
+    print("[INFO] Pattern similarity matrix:")
+    for i, cls_i in enumerate(classes):
+        sims = []
+        for j, cls_j in enumerate(classes):
+            sim = np.dot(pattern_matrix[i], pattern_matrix[j]) / args.reduce_dim
+            sims.append(f"{sim:+.2f}")
+        print(f"  {cls_i}: {sims}")
 
-    D = 561
-    in_dim = 2 * D  # 1122 bipolar input neurons
-    out_dim = 6
+    # Compute Hopfield weights
+    if args.use_storkey:
+        print("[INFO] Using Storkey learning rule")
+        W = hopfield_weights_storkey(pattern_matrix)
+    else:
+        print("[INFO] Using Hebbian learning rule")
+        W = hopfield_weights(pattern_matrix)
+    
+    Wq, scale = quantize_weights_hopfield(W, w_max=15)
+    
+    nnz = np.count_nonzero(Wq)
+    print(f"[INFO] Hopfield weights: {Wq.shape}, nonzero: {nnz}")
 
-    # Bipolar expansion for W1: [W, -W] -> [128,1122]
-    W1_bipolar = np.concatenate([W1, -W1], axis=1)
-
-    W1q, s1 = quantize_weights(W1_bipolar, w_max=args.w_max)
-    W2q, s2 = quantize_weights(W2, w_max=args.w_max)
-    W3q, s3 = quantize_weights(W3, w_max=args.w_max)
-
-    # Hidden layer diagonal sharding
-    shards = max(1, int(args.shards))
-    if 128 % shards != 0 or 64 % shards != 0:
-        raise ValueError("shards must divide H1=128 and H2=64 (valid: 1,2,4,8,16,32,64).")
-    h1_sh = 128 // shards
-    h2_sh = 64 // shards
-
-    W1_blocks = []
-    W2_blocks = []
-    W3_blocks = []
-    for i in range(shards):
-        W1_blocks.append(W1q[i * h1_sh:(i + 1) * h1_sh, :])  # [h1_sh, in_dim]
-        W2_blocks.append(W2q[i * h2_sh:(i + 1) * h2_sh, i * h1_sh:(i + 1) * h1_sh])  # [h2_sh, h1_sh]
-        W3_blocks.append(W3q[:, i * h2_sh:(i + 1) * h2_sh])  # [out_dim, h2_sh]
-
-    # Input ranges (can be uneven)
-    input_ranges = compute_ranges(in_dim, args.input_shards)
-
-    print("[INFO] BIPOLAR encoding enabled")
-    print(f"[INFO] Hidden sharding: {shards} shards | H1={shards}x{h1_sh}, H2={shards}x{h2_sh}")
-    print(f"[INFO] Input sharding: {len(input_ranges)} shards | total IN={in_dim}")
-    print(f"[INFO] Shapes: input={in_dim}, out={out_dim}")
-    print(f"[INFO] Quant scales: s1={s1:.3f}, s2={s2:.3f}, s3={s3:.3f}")
-
+    # ========== DRY RUN ==========
     if args.dry_run:
-        approx_L1 = int(np.count_nonzero(W1q))
-        approx_L2 = int(np.count_nonzero(W2q))
-        approx_L3 = int(np.count_nonzero(W3q))
-        print(f"[INFO] Approx nonzero synapses: L1={approx_L1}, L2={approx_L2}, L3={approx_L3}")
-        print("[DRY RUN] Not connecting to hardware. Conversion looks OK.")
+        print("\n[DRY RUN] Testing Hopfield classification (numpy)...")
+        correct = 0
+        tested = min(args.num_samples, len(X_test_pca))
+        
+        class_correct = {cls: 0 for cls in classes}
+        class_total = {cls: 0 for cls in classes}
+        
+        for i in range(tested):
+            pred_cls, _ = classify_hopfield(X_test_pca[i], prototypes, W)
+            true_cls = y_test[i]
+            ok = (pred_cls == true_cls)
+            correct += int(ok)
+            class_total[true_cls] += 1
+            if ok:
+                class_correct[true_cls] += 1
+            print(f"  Sample {i}: true={true_cls}, pred={pred_cls}, ok={ok}")
+        
+        acc = correct / tested
+        print(f"\n[DRY RUN RESULT] Accuracy: {acc:.4f} ({correct}/{tested})")
+        print("\nPer-class accuracy:")
+        for cls in classes:
+            if class_total[cls] > 0:
+                print(f"  {cls}: {class_correct[cls]}/{class_total[cls]} = {class_correct[cls]/class_total[cls]:.2%}")
         return
 
-    # Hardware imports
-    from spinnaker2 import hardware, snn
+    # ========== SpiNNaker2 ==========
+    print(f"\n[INFO] Running on SpiNNaker2...")
+    print(f"[INFO] Duration: {args.duration_ms}ms per sample")
 
-    lif_params = {
-        "threshold": 10.0,
-        "alpha_decay": 0.9,
-        "i_offset": 0.0,
-        "v_reset": 0.0,
-        "reset": "reset_by_subtraction",
-    }
-
-    hw = hardware.SpiNNcloud48NodeBoard(stm_ip=args.s2_ip)
-    print(f"[OK] Connected to SpiNNcloud48NodeBoard at STM_IP={args.s2_ip}")
-
-
-    tested = min(int(args.num_samples), X_test.shape[0])
+    tested = min(args.num_samples, len(X_test_pca))
     correct = 0
 
     for idx in range(tested):
-        rates = bipolar_rates(X_test[idx], r_max_hz=args.r_max_hz)
-        net = snn.Network(f"HAR_SNN_HW_{idx}")
-
-        # Input populations (sharded)
-        stim_pops = []
-        for j, (lo, hi) in enumerate(input_ranges):
-            local_rates = rates[lo:hi]
-            spike_in = poisson_spike_list(
-                local_rates,
+        query = X_test_pca[idx]
+        query_bin = binarize(query)
+        true_cls = y_test[idx]
+        
+        try:
+            pred_cls, final_state, total_spikes, sims = run_single_sample(
+                query_bin=query_bin,
+                Wq=Wq,
+                prototypes=prototypes,
+                classes=classes,
+                s2_ip=args.s2_ip,
                 duration_ms=args.duration_ms,
-                seed=args.seed + idx * 10000 + j,
+                sample_idx=idx
             )
-            stim = snn.Population(
-                size=(hi - lo),
-                neuron_model="spike_list",
-                params=spike_in,
-                name=f"IN_{j}",
-            )
-            set_atoms(stim, args.in_per_core)
-            stim_pops.append(stim)
-
-        # Hidden pops
-        h1_pops = []
-        h2_pops = []
-        for i in range(shards):
-            h1 = snn.Population(size=h1_sh, neuron_model="lif_curr_exp", params=lif_params,
-                                name=f"H1_{i}", record=["spikes"])
-            h2 = snn.Population(size=h2_sh, neuron_model="lif_curr_exp", params=lif_params,
-                                name=f"H2_{i}", record=["spikes"])
-            set_atoms(h1, args.h1_per_core)
-            set_atoms(h2, args.h2_per_core)
-            h1_pops.append(h1)
-            h2_pops.append(h2)
-
-        out = snn.Population(size=out_dim, neuron_model="lif_curr_exp", params=lif_params,
-                             name="OUT", record=["spikes"])
-        set_atoms(out, args.out_per_core)
-
-        projs = []
-
-        # IN -> H1 : for each H1 shard, connect each input shard slice
-        for i in range(shards):
-            W1_blk = W1_blocks[i]  # [h1_sh, in_dim]
-            for j, (lo, hi) in enumerate(input_ranges):
-                conns = dense_to_conn_list_pre_slice(W1_blk, pre_lo=lo, pre_hi=hi, delay=1)
-                if conns:
-                    projs.append(snn.Projection(pre=stim_pops[j], post=h1_pops[i], connections=conns))
-
-        # H1 -> H2 diagonal
-        for i in range(shards):
-            conns2 = dense_to_conn_list(W2_blocks[i], delay=1)
-            if conns2:
-                projs.append(snn.Projection(pre=h1_pops[i], post=h2_pops[i], connections=conns2))
-
-        # H2 -> OUT merge
-        for i in range(shards):
-            conns3 = dense_to_conn_list(W3_blocks[i], delay=1)
-            if conns3:
-                projs.append(snn.Projection(pre=h2_pops[i], post=out, connections=conns3))
-
-        net.add(*stim_pops, *h1_pops, *h2_pops, out, *projs)
-
-        hw.run(net, args.duration_ms)
-
-        out_spikes = out.get_spikes()
-        pred, counts = decode_output(out_spikes, out_dim=out_dim)
-        ok = (pred == int(y_test[idx]))
-        correct += int(ok)
-
-        print(
-            f"Sample {idx:04d} | true={classes[int(y_test[idx])]} pred={classes[pred]} "
-            f"| out_counts={counts.tolist()} | ok={ok}"
-        )
+            
+            ok = (pred_cls == true_cls)
+            correct += int(ok)
+            
+            print(f"Sample {idx:04d} | true={true_cls:20s} pred={pred_cls:20s} | spikes={total_spikes:4d} | ok={ok}")
+            
+        except Exception as e:
+            print(f"Sample {idx:04d} | ERROR: {e}")
 
     acc = correct / tested if tested else 0.0
-    print(f"\n[RESULT] Tested {tested} samples | Accuracy: {acc:.4f}")
+    print(f"\n[RESULT] Hopfield Network Accuracy: {acc:.4f} ({correct}/{tested})")
 
 
 if __name__ == "__main__":
